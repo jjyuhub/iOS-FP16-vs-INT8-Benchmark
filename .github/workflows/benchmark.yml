@@ -1,0 +1,408 @@
+name: iOS FP16 vs INT8 Benchmark
+
+on:
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      device:
+        description: 'Target iOS device simulator'
+        required: true
+        default: 'iPhone 15 Pro'
+      ios-version:
+        description: 'iOS version'
+        required: true
+        default: '17.2'
+      benchmark-iterations:
+        description: 'Number of benchmark iterations'
+        required: true
+        default: '10'
+      model-size:
+        description: 'ML model size (small, medium, large)'
+        required: true
+        default: 'medium'
+  
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'Benchmark/**'
+      - 'MLModels/**'
+      - '.github/workflows/benchmark.yml'
+  
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'Benchmark/**'
+      - 'MLModels/**'
+      - '.github/workflows/benchmark.yml'
+
+jobs:
+  benchmark:
+    name: Run FP16 vs INT8 Benchmarks
+    runs-on: macos-latest
+    
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      BENCHMARK_RESULTS_PATH: benchmark-results
+      DEVICE_NAME: ${{ github.event.inputs.device || 'iPhone 15 Pro' }}
+      IOS_VERSION: ${{ github.event.inputs.ios-version || '17.2' }}
+      ITERATIONS: ${{ github.event.inputs.benchmark-iterations || '10' }}
+      MODEL_SIZE: ${{ github.event.inputs.model-size || 'medium' }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+      
+      - name: Setup Ruby for Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.0'
+          bundler-cache: true
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install Dependencies
+        run: |
+          gem install fastlane
+          brew install coreutils
+          python -m pip install matplotlib numpy pandas
+      
+      - name: Install CocoaPods Dependencies
+        run: |
+          cd Benchmark
+          pod install
+        
+      - name: Setup Benchmark Environment
+        run: |
+          mkdir -p $BENCHMARK_RESULTS_PATH
+          echo "Setting up benchmark for $DEVICE_NAME on iOS $IOS_VERSION"
+          echo "Will run $ITERATIONS iterations for $MODEL_SIZE model"
+      
+      - name: Convert ML Models to FP16 and INT8
+        run: |
+          echo "Converting ML models to FP16 and INT8 formats..."
+          
+          # Create a Python script to convert models
+          cat > convert_models.py << 'EOF'
+          import coremltools as ct
+          import argparse
+          
+          def convert_model(model_path, precision):
+              """Convert model to specified precision (FP16 or INT8)"""
+              # Load the model
+              model = ct.models.MLModel(model_path)
+              
+              # Set conversion options based on precision
+              if precision == "fp16":
+                  config = ct.ComputePrecision.FLOAT16
+              elif precision == "int8":
+                  config = ct.ComputePrecision.INT8
+              else:
+                  raise ValueError(f"Unsupported precision: {precision}")
+              
+              # Convert the model
+              converted_model = ct.compression_utils.convert_weights_to_precision(model, config)
+              
+              # Save the model
+              output_path = model_path.replace(".mlmodel", f"_{precision}.mlmodel")
+              converted_model.save(output_path)
+              print(f"Converted model saved to: {output_path}")
+              return output_path
+          
+          if __name__ == "__main__":
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--model", required=True, help="Path to .mlmodel file")
+              parser.add_argument("--precision", choices=["fp16", "int8"], required=True)
+              args = parser.parse_args()
+              
+              convert_model(args.model, args.precision)
+          EOF
+          
+          # Execute conversion for specified model size
+          python convert_models.py --model "MLModels/${MODEL_SIZE}_model.mlmodel" --precision "fp16"
+          python convert_models.py --model "MLModels/${MODEL_SIZE}_model.mlmodel" --precision "int8"
+          
+          # Move converted models to the right location
+          mv MLModels/*_fp16.mlmodel Benchmark/BenchmarkApp/Models/
+          mv MLModels/*_int8.mlmodel Benchmark/BenchmarkApp/Models/
+      
+      - name: Build Benchmark App
+        run: |
+          cd Benchmark
+          fastlane build_benchmark device:"$DEVICE_NAME" ios:"$IOS_VERSION"
+      
+      - name: Run FP16 Benchmarks
+        run: |
+          cd Benchmark
+          echo "Running FP16 benchmarks..."
+          fastlane run_benchmark precision:fp16 iterations:$ITERATIONS device:"$DEVICE_NAME" ios:"$IOS_VERSION" \
+            output_path:"../$BENCHMARK_RESULTS_PATH/fp16_results.json"
+      
+      - name: Run INT8 Benchmarks
+        run: |
+          cd Benchmark
+          echo "Running INT8 benchmarks..."
+          fastlane run_benchmark precision:int8 iterations:$ITERATIONS device:"$DEVICE_NAME" ios:"$IOS_VERSION" \
+            output_path:"../$BENCHMARK_RESULTS_PATH/int8_results.json"
+      
+      - name: Analyze and Compare Results
+        run: |
+          echo "Analyzing benchmark results..."
+          
+          # Create Python script for analysis
+          cat > analyze_results.py << 'EOF'
+          import json
+          import pandas as pd
+          import matplotlib.pyplot as plt
+          import numpy as np
+          import os
+          
+          # Load benchmark results
+          def load_results(fp16_path, int8_path):
+              with open(fp16_path, 'r') as f:
+                  fp16_data = json.load(f)
+              
+              with open(int8_path, 'r') as f:
+                  int8_data = json.load(f)
+              
+              return fp16_data, int8_data
+          
+          # Generate comparison metrics
+          def analyze_results(fp16_data, int8_data):
+              # Create pandas DataFrames
+              df_fp16 = pd.DataFrame(fp16_data['results'])
+              df_int8 = pd.DataFrame(int8_data['results'])
+              
+              # Calculate statistics
+              fp16_stats = {
+                  'mean_latency': df_fp16['latency_ms'].mean(),
+                  'median_latency': df_fp16['latency_ms'].median(),
+                  'std_latency': df_fp16['latency_ms'].std(),
+                  'mean_throughput': df_fp16['operations_per_second'].mean(),
+                  'mean_power': df_fp16['power_consumption'].mean() if 'power_consumption' in df_fp16 else None,
+                  'accuracy': fp16_data.get('accuracy', 'N/A')
+              }
+              
+              int8_stats = {
+                  'mean_latency': df_int8['latency_ms'].mean(),
+                  'median_latency': df_int8['latency_ms'].median(),
+                  'std_latency': df_int8['latency_ms'].std(),
+                  'mean_throughput': df_int8['operations_per_second'].mean(),
+                  'mean_power': df_int8['power_consumption'].mean() if 'power_consumption' in df_int8 else None,
+                  'accuracy': int8_data.get('accuracy', 'N/A')
+              }
+              
+              # Calculate improvements
+              improvements = {
+                  'latency_improvement': ((fp16_stats['mean_latency'] - int8_stats['mean_latency']) / fp16_stats['mean_latency']) * 100,
+                  'throughput_improvement': ((int8_stats['mean_throughput'] - fp16_stats['mean_throughput']) / fp16_stats['mean_throughput']) * 100,
+              }
+              
+              if fp16_stats['mean_power'] and int8_stats['mean_power']:
+                  improvements['power_improvement'] = ((fp16_stats['mean_power'] - int8_stats['mean_power']) / fp16_stats['mean_power']) * 100
+              
+              if fp16_stats['accuracy'] != 'N/A' and int8_stats['accuracy'] != 'N/A':
+                  improvements['accuracy_difference'] = float(fp16_stats['accuracy']) - float(int8_stats['accuracy'])
+              
+              return {
+                  'fp16': fp16_stats,
+                  'int8': int8_stats,
+                  'improvements': improvements
+              }
+          
+          # Create visualizations
+          def create_visualizations(stats, output_dir):
+              # Latency Comparison
+              plt.figure(figsize=(10, 6))
+              plt.bar(['FP16', 'INT8'], [stats['fp16']['mean_latency'], stats['int8']['mean_latency']], 
+                      color=['#00FFFF', '#FF00AA'])
+              plt.title('Average Inference Latency (ms)')
+              plt.ylabel('Milliseconds (lower is better)')
+              plt.grid(axis='y', linestyle='--', alpha=0.7)
+              plt.savefig(os.path.join(output_dir, 'latency_comparison.png'))
+              
+              # Throughput Comparison
+              plt.figure(figsize=(10, 6))
+              plt.bar(['FP16', 'INT8'], [stats['fp16']['mean_throughput'], stats['int8']['mean_throughput']], 
+                      color=['#00FFFF', '#FF00AA'])
+              plt.title('Operations per Second')
+              plt.ylabel('Operations/s (higher is better)')
+              plt.grid(axis='y', linestyle='--', alpha=0.7)
+              plt.savefig(os.path.join(output_dir, 'throughput_comparison.png'))
+              
+              # Create summary table
+              plt.figure(figsize=(12, 6))
+              plt.axis('off')
+              improvement_text = f"""
+              # FP16 vs INT8 Benchmark Summary
+              
+              ## Performance Improvements with INT8
+              - Latency: {stats['improvements']['latency_improvement']:.2f}% improvement
+              - Throughput: {stats['improvements']['throughput_improvement']:.2f}% improvement
+              
+              ## Detailed Metrics
+              
+              | Metric | FP16 | INT8 | Difference |
+              |--------|------|------|------------|
+              | Avg. Latency (ms) | {stats['fp16']['mean_latency']:.2f} | {stats['int8']['mean_latency']:.2f} | {stats['fp16']['mean_latency'] - stats['int8']['mean_latency']:.2f} |
+              | Throughput (ops/s) | {stats['fp16']['mean_throughput']:.2f} | {stats['int8']['mean_throughput']:.2f} | {stats['int8']['mean_throughput'] - stats['fp16']['mean_throughput']:.2f} |
+              """
+              
+              if 'power_improvement' in stats['improvements']:
+                  improvement_text += f"| Power Consumption | {stats['fp16']['mean_power']:.2f}W | {stats['int8']['mean_power']:.2f}W | {stats['improvements']['power_improvement']:.2f}% |\n"
+              
+              if 'accuracy_difference' in stats['improvements']:
+                  improvement_text += f"| Accuracy | {stats['fp16']['accuracy']}% | {stats['int8']['accuracy']}% | {stats['improvements']['accuracy_difference']:.2f}% |\n"
+              
+              plt.text(0.1, 0.5, improvement_text, fontsize=12, ha='left', va='center', transform=plt.gca().transAxes)
+              plt.savefig(os.path.join(output_dir, 'summary.png'))
+              
+              # Write results to text file
+              with open(os.path.join(output_dir, 'benchmark_report.md'), 'w') as f:
+                  f.write(improvement_text)
+          
+          # Main execution
+          if __name__ == "__main__":
+              fp16_results = os.environ.get('FP16_RESULTS', 'benchmark-results/fp16_results.json')
+              int8_results = os.environ.get('INT8_RESULTS', 'benchmark-results/int8_results.json')
+              output_dir = os.environ.get('OUTPUT_DIR', 'benchmark-results')
+              
+              print(f"Loading results from {fp16_results} and {int8_results}")
+              fp16_data, int8_data = load_results(fp16_results, int8_results)
+              
+              print("Analyzing results...")
+              stats = analyze_results(fp16_data, int8_data)
+              
+              print("Creating visualizations...")
+              create_visualizations(stats, output_dir)
+              
+              print(f"Results saved to {output_dir}")
+          EOF
+          
+          # Run analysis
+          export FP16_RESULTS="$BENCHMARK_RESULTS_PATH/fp16_results.json"
+          export INT8_RESULTS="$BENCHMARK_RESULTS_PATH/int8_results.json"
+          export OUTPUT_DIR="$BENCHMARK_RESULTS_PATH"
+          python analyze_results.py
+      
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: ${{ env.BENCHMARK_RESULTS_PATH }}
+          retention-days: 90
+      
+      - name: Create Result Summary in PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const reportPath = 'benchmark-results/benchmark_report.md';
+            
+            if (fs.existsSync(reportPath)) {
+              const report = fs.readFileSync(reportPath, 'utf8');
+              const reportComment = `## FP16 vs INT8 Benchmark Results\n\n${report}\n\n[Full benchmark results](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID})`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: reportComment
+              });
+            }
+
+  # This job summarizes results in a GitHub Pages site (optional)
+  update-benchmark-history:
+    name: Update Benchmark History
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' # Only run on main branch
+    
+    steps:
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v3
+        with:
+          ref: gh-pages
+          path: gh-pages
+      
+      - name: Download benchmark results
+        uses: actions/download-artifact@v3
+        with:
+          name: benchmark-results
+          path: latest-results
+      
+      - name: Update benchmark history
+        run: |
+          # Create directories if they don't exist
+          mkdir -p gh-pages/history/$(date +%Y-%m-%d)
+          
+          # Copy latest results to dated folder
+          cp -r latest-results/* gh-pages/history/$(date +%Y-%m-%d)/
+          
+          # Update latest results
+          cp -r latest-results/* gh-pages/latest/
+          
+          # Update index page
+          cat > gh-pages/index.html << EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>iOS FP16 vs INT8 Benchmark History</title>
+            <style>
+              body { font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 20px; }
+              .container { max-width: 1200px; margin: 0 auto; }
+              h1 { color: #333; }
+              .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+              img { max-width: 100%; height: auto; }
+              .latest { border-left: 5px solid #00FFFF; }
+              .history { border-left: 5px solid #FF00AA; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>iOS FP16 vs INT8 Benchmark Results</h1>
+              
+              <div class="card latest">
+                <h2>Latest Results ($(date +%Y-%m-%d))</h2>
+                <p>Device: $DEVICE_NAME, iOS: $IOS_VERSION, Model: $MODEL_SIZE</p>
+                <img src="latest/summary.png" alt="Summary" />
+                <div>
+                  <img src="latest/latency_comparison.png" alt="Latency Comparison" style="width: 48%;" />
+                  <img src="latest/throughput_comparison.png" alt="Throughput Comparison" style="width: 48%;" />
+                </div>
+                <p><a href="latest/benchmark_report.md">View detailed report</a></p>
+              </div>
+              
+              <div class="card history">
+                <h2>Benchmark History</h2>
+                <ul>
+          EOF
+          
+          # Add history entries
+          for dir in $(ls -d gh-pages/history/* | sort -r); do
+            date=$(basename $dir)
+            echo "        <li><a href=\"history/$date/benchmark_report.md\">$date</a></li>" >> gh-pages/index.html
+          done
+          
+          # Close HTML
+          cat >> gh-pages/index.html << EOF
+                </ul>
+              </div>
+            </div>
+          </body>
+          </html>
+          EOF
+      
+      - name: Deploy to GitHub Pages
+        run: |
+          cd gh-pages
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add .
+          git commit -m "Update benchmark results - $(date +%Y-%m-%d)"
+          git push
