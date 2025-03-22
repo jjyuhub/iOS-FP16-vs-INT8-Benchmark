@@ -289,7 +289,7 @@ jobs:
           python analyze_results.py
       
       - name: Upload Benchmark Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: ${{ env.BENCHMARK_RESULTS_PATH }}
@@ -331,7 +331,7 @@ jobs:
           path: gh-pages
       
       - name: Download benchmark results
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: benchmark-results
           path: latest-results
